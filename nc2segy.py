@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 """
-Convert airborne ice-penetrating-radar profiles from NetCDF to SEG-Y rev 1.
+Convert airborne ice-penetrating-radar profiles to SEG-Y rev 1, from NetCDF or
+from existing radar SEG-Y files whose time axis needs correcting.
 
 Each radar trace (one position along the flight line) becomes one SEG-Y trace,
 and the fast-time axis (two-way travel time) becomes the SEG-Y sample axis.
 Samples are written as 32-bit IEEE floats (format code 5).
 
-Two file layouts are recognised automatically:
-  bas   BAS / UK Polar Data Centre PASIN files (e.g. WISE_ISODYN_W15.nc)
-  utig  UTIG / ICECAP HiCARS L1B files (e.g. ER2HI1B_*.nc)
-Anything else can be converted by naming the variables on the command line.
+Recognised inputs:
+  bas   BAS / UK Polar Data Centre PASIN NetCDF (e.g. WISE_ISODYN_W15.nc)
+  utig  UTIG / ICECAP HiCARS L1B NetCDF (e.g. ER2HI1B_*.nc)
+  .segy / .sgy files, including the BAS-supplied PASIN SEG-Y (e.g. W15_chirp.segy)
+Other NetCDF layouts can be converted by naming the variables.
 
-Time convention
----------------
+Time axis (--axis)
+------------------
 SEG-Y stores the sample interval as a whole number of microseconds, which is
-too coarse for radar. As in the BAS SEG-Y files, the default here stores the
-interval in NANOSECONDS, so seismic software that labels its time axis "ms"
-is really showing microseconds of two-way travel time. If the interval is not
-a whole number of nanoseconds (PASIN samples at 22 MHz, i.e. 45.45 ns), the
-traces are by default linearly resampled onto the nearest whole-nanosecond
-interval, so travel times stay correct. "--inexact round" instead keeps the
-samples and rounds the header value, which is what the BAS files do; that
-stretches the time axis by the rounding error (about 1 % for 45.45 -> 45 ns).
+too coarse for radar, so the header unit is redefined. --axis says what a time
+axis labelled "ms" in interpretation software will show:
+  us  (default) header unit = 1 ns, so "ms" reads as microseconds, as in the
+      BAS SEG-Y files. A 40 us bed echo appears at 40 "ms".
+  ns  header unit = 1 ps, so "ms" reads as nanoseconds (40 us -> 40000 "ms").
+      Intervals above 32.767 ns do not fit the 16-bit field, so such traces
+      are upsampled by a whole factor; every original sample is kept.
+  ms  true SEG-Y units. Refused for radar, because whole microseconds would
+      discard most of the samples.
+If the interval is not a whole number of header units (PASIN: 45.45 ns), the
+traces are by default linearly resampled so travel times stay correct;
+"--inexact round" keeps the samples and rounds the header value instead,
+which is what the BAS files do and makes every travel time about 1 % short.
 
 Examples
 --------
     python nc2segy.py WISE_ISODYN_W15.nc --outdir segy/
-    python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --outdir segy/
+    python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --axis ns --outdir segy/
+    python nc2segy.py W15_chirp.segy --outdir segy/          # repair BAS SEG-Y
     python nc2segy.py W15.nc --data chirp_data --date YYYY-MM-DD   # BAS files give no flight date
 
 Requires: numpy, pandas, xarray, netCDF4, segyio; pyproj when projecting lat/lon.
@@ -51,8 +59,11 @@ TIME_UNITS_TO_S = {
     "ns": 1e-9, "nanoseconds": 1e-9, "ps": 1e-12, "picoseconds": 1e-12,
 }
 
-# What one stored header unit means for each choice of --time-units.
-HEADER_UNIT_S = {"us": 1e-6, "ns": 1e-9, "ps": 1e-12}
+# What a time axis labelled "ms" in interpretation software should show, and
+# the length of one stored header unit that achieves it. Software reads the
+# header interval as microseconds, so storing nanoseconds makes "ms" read as us.
+AXIS_UNIT_S = {"ms": 1e-6, "us": 1e-9, "ns": 1e-12}
+AXIS_UNIT_NAME = {"ms": "us", "us": "ns", "ns": "ps"}
 
 MAX_INT16 = 32767          # SEG-Y rev 1 sample interval and count are 16-bit
 MISSING = -9999.0          # BAS marks missing navigation values this way
@@ -69,9 +80,10 @@ PRESETS = {
         time_of_day="UTC_time_layerData", record="PriNumber_layerData",
         trace_no="traces",
         # The fast_time axis in these files spans 0 to N*dt over N samples, so its
-        # spacing is slightly too large; the 22 MHz digitiser (45.4545 ns) is the
-        # interval BAS's own ice thicknesses are consistent with.
-        prefer_metadata_dt=True),
+        # spacing is slightly too large. Use the 22 MHz digitiser interval
+        # (45.4545 ns; the metadata round it to 45.4546), which BAS's own ice
+        # thicknesses are consistent with. The same value is used for BAS SEG-Y.
+        dt_s=1 / 22e6),
     "utig": dict(
         detect="amplitude_high_gain",
         data=["amplitude_high_gain", "amplitude_low_gain"], trace_dim="time",
@@ -152,6 +164,77 @@ def text_header(lines):
     return "".join(f"C{i + 1:2d} {l:<76}" for i, l in enumerate(lines))
 
 
+def plan_time_axis(t0, dt, n, args):
+    """
+    Decide how the fast-time axis will be stored, given the true first-sample
+    time t0 and interval dt (seconds) and the sample count n.
+
+    SEG-Y holds the interval as a signed 16-bit whole number of header units
+    (1 to 32767). Three things can force the samples to be recomputed:
+      * the interval is too long for 32767 units (e.g. 45 ns in picoseconds),
+        so the trace is upsampled by a whole factor k; every original sample
+        is kept, and linear interpolation fills the points in between;
+      * the interval is not a whole number of units (45.45 ns in nanoseconds),
+        so with --inexact resample the trace is interpolated onto a grid that is;
+      * the units are so coarse that whole units would discard samples, which
+        is refused.
+    Returns a dict with the stored interval, sample count, interpolation
+    indices and weights (None if the samples are written unchanged) and a note.
+    """
+    unit = AXIS_UNIT_S[args.axis]
+    uname = AXIS_UNIT_NAME[args.axis]
+
+    # Upsampling factor needed for the interval to fit in 16 bits.
+    k = int(np.ceil(dt / unit / MAX_INT16))
+    dt_k = dt / k
+    stored = max(1, int(round(dt_k / unit)))
+    if stored * unit > 1.05 * dt_k:
+        raise ValueError(
+            f"A {dt * 1e9:.4f} ns interval cannot be written in whole {uname}: it would "
+            f"need resampling to {stored} {uname}, discarding about "
+            f"{1 - dt_k / (stored * unit):.0%} of the samples. Choose a finer --axis.")
+    exact = abs(dt_k / unit - stored) < 1e-4 * dt_k / unit
+    if not exact and args.inexact == "fail":
+        raise ValueError(f"Interval {dt * 1e9:.4f} ns is not a whole number of {uname}.")
+
+    # Interval of the grid actually written.
+    grid_dt = stored * unit if (not exact and args.inexact == "resample") else dt_k
+    t_old = t0 + dt * np.arange(n)
+    if grid_dt == dt:
+        n_new, idx, wgt = n, None, None
+    else:
+        n_new = int(np.floor((t_old[-1] - t0) / grid_dt + 1e-9)) + 1
+        idx, wgt = resample_weights(t_old, t0 + grid_dt * np.arange(n_new))
+
+    # Relative error of the stored header interval against the written grid.
+    stretch = stored * unit / grid_dt - 1
+    if abs(stretch) > 1e-4:
+        warnings.warn(f"Header interval rounded from {grid_dt / unit:.4f} to {stored} {uname}: "
+                      f"every travel time read from the SEG-Y is off by {stretch:+.2%} "
+                      f"({stretch * (n_new - 1) * grid_dt * 1e6:+.3f} us at the last sample).")
+    if n_new > MAX_INT16:
+        raise ValueError(f"{n_new} samples per trace exceeds the SEG-Y rev 1 limit of "
+                         f"{MAX_INT16}; choose a coarser --axis or crop fast time.")
+
+    if idx is None:
+        note = "ORIGINAL SAMPLES, UNCHANGED"
+    elif grid_dt == dt_k:
+        note = f"UPSAMPLED X{k} BY LINEAR INTERPOLATION; ORIGINAL SAMPLES KEPT"
+    else:
+        note = f"RESAMPLED LINEARLY FROM {dt * 1e9:.4f} NS TO {grid_dt * 1e9:.4f} NS"
+    err = (f"HEADER INTERVAL ERROR {stretch:+.4%} "
+           f"({stretch * (n_new - 1) * grid_dt * 1e9:+.2f} NS AT LAST SAMPLE)")
+    return dict(stored=stored, n=n_new, idx=idx, wgt=wgt, note=note, err=err, uname=uname)
+
+
+def axis_text_lines(args, plan):
+    """Text-header lines explaining the time convention."""
+    shows = {"ms": "MS", "us": "US", "ns": "NS"}[args.axis]
+    return [f"SAMPLE INTERVAL HEADER UNIT = 1 {plan['uname'].upper()}",
+            f"SO A TIME AXIS LABELLED MS SHOWS {shows} OF TWO-WAY TRAVEL TIME",
+            plan["note"], plan["err"]]
+
+
 # --------------------------------------------------------------- converter --
 
 
@@ -171,44 +254,20 @@ def convert(ds, src, data_name, out_path, cfg, args):
         dt = args.dt_ns * 1e-9
     t_old = t0 + dt * np.arange(t_file.size)         # regularised true times
 
+    if cfg.get("dt_s") and not args.dt_ns:          # known digitiser interval
+        if abs(cfg["dt_s"] - dt) / dt > 2e-4:
+            print(f"    using digitiser interval {cfg['dt_s'] * 1e9:.4f} ns instead of "
+                  f"the axis spacing {dt * 1e9:.4f} ns")
+        dt = cfg["dt_s"]
     meta_dt = metadata_interval_s(ds)
-    if meta_dt and not args.dt_ns and cfg.get("prefer_metadata_dt"):
-        if abs(meta_dt - dt) / meta_dt > 2e-4:
-            print(f"    using metadata interval {meta_dt * 1e9:.4f} ns instead of the "
-                  f"axis spacing {dt * 1e9:.4f} ns")
-        dt = meta_dt
-        t_old = t0 + dt * np.arange(t_file.size)
-    elif meta_dt and not args.dt_ns and abs(meta_dt - dt) / meta_dt > 2e-4:
+    if meta_dt and not args.dt_ns and abs(meta_dt - dt) / meta_dt > 2e-4:
         warnings.warn(
             f"Fast-time axis spacing is {dt * 1e9:.4f} ns, but the metadata quote "
             f"{meta_dt * 1e9:.4f} ns ({(dt / meta_dt - 1):+.3%}). If the metadata are "
             f"right, rerun with --dt-ns {meta_dt * 1e9:.4f}.")
 
-    unit = HEADER_UNIT_S[args.time_units]
-    exact = abs(dt / unit - round(dt / unit)) < 1e-4 * dt / unit
-    resample = (not exact) and args.inexact == "resample"
-    if not exact and args.inexact == "fail":
-        raise ValueError(f"Interval {dt * 1e9:.4f} ns is not a whole number of {args.time_units}.")
-    dt_stored = max(1, int(round(dt / unit)))
-    if resample:
-        dt_new = dt_stored * unit
-        n_new = int(np.floor((t_old[-1] - t0) / dt_new + 1e-9)) + 1
-        t_new = t0 + dt_new * np.arange(n_new)
-        idx, wgt = resample_weights(t_old, t_new)
-        n_smp = n_new
-        note = (f"RESAMPLED LINEARLY FROM {dt * 1e9:.4f} NS TO {dt_stored} {args.time_units}")
-    else:
-        n_smp = t_file.size
-        stretch = dt_stored * unit / dt - 1
-        if not exact:
-            warnings.warn(f"Header interval rounded from {dt * 1e9:.4f} ns to "
-                          f"{dt_stored} {args.time_units}: every travel time read from "
-                          f"the SEG-Y is off by {stretch:+.2%} "
-                          f"({stretch * t_old[-1] * 1e6:+.3f} us at the last sample).")
-        note = f"NATIVE SAMPLES; HEADER INTERVAL ERROR {stretch:+.3%}"
-    if dt_stored > MAX_INT16 or n_smp > MAX_INT16:
-        raise ValueError("Interval or sample count does not fit SEG-Y rev 1 16-bit fields; "
-                         "choose coarser --time-units or crop fast time.")
+    plan = plan_time_axis(t0, dt, t_file.size, args)
+    dt_stored, n_smp, note = plan["stored"], plan["n"], plan["note"]
 
     # ---- per-trace navigation ----------------------------------------------
     def var(key):
@@ -258,9 +317,7 @@ def convert(ds, src, data_name, out_path, cfg, args):
         f"VARIABLE {data_name} UNITS {units}",
         f"INSTITUTION {str(ds.attrs.get('institution', '')).splitlines()[0] if ds.attrs.get('institution') else 'UNKNOWN'}",
         f"FLIGHT {ds.attrs.get('flight', '')} CAMPAIGN {ds.attrs.get('campaign', '')}",
-        f"SAMPLE INTERVAL HEADER UNIT = 1 {args.time_units.upper()} (NOT US)",
-        "SO A TIME AXIS LABELLED MS SHOWS US OF TWO-WAY TRAVEL TIME" if args.time_units == "ns" else "",
-        note,
+        *axis_text_lines(args, plan),
         f"FIRST SAMPLE {t0 * 1e6:.4f} US OF RECORD TIME",
         f"COORDS {crs} METRES, SCALAR {cs}; ELEVATIONS M WGS84 SCALAR {es}",
         "BYTE 41 ANTENNA ALTITUDE; BYTE 45 ICE SURFACE ELEVATION IF GIVEN",
@@ -296,8 +353,9 @@ def convert(ds, src, data_name, out_path, cfg, args):
                                   "Use --to-db to write 10*log10 values.")
             if args.to_db:
                 block = 10 * np.log10(np.maximum(block, np.finfo(np.float32).tiny))
-            if resample:
-                block = block[:, idx] * (1 - wgt) + block[:, idx + 1] * wgt
+            if plan["idx"] is not None:
+                i0, w = plan["idx"], plan["wgt"]
+                block = block[:, i0] * (1 - w) + block[:, i0 + 1] * w
             block = block.astype(np.float32)
             bad = ~np.isfinite(block)
             n_bad += int(bad.sum())
@@ -344,17 +402,96 @@ def convert(ds, src, data_name, out_path, cfg, args):
                 f.trace[i] = np.ascontiguousarray(block[j])
 
     print(f"  {data_name}: {n_tr} traces x {n_smp} samples, interval {dt_stored} "
-          f"{args.time_units} -> {out_path}")
+          f"{plan['uname']} -> {out_path}")
     if n_bad:
         print(f"    {n_bad} non-finite samples written as 0")
     if n_nopos:
         print(f"    {n_nopos} traces without position (coordinates left at 0)")
 
 
+def convert_segy(src, out_path, args):
+    """
+    Rewrite an existing radar SEG-Y file with a correct time axis.
+
+    Made for the BAS-supplied PASIN SEG-Y files, which store a rounded 45 ns
+    interval in the trace headers, 1000 in the binary header, and file-creation
+    dates in the acquisition-time fields. For BAS files the true interval is
+    taken as 45.4546 ns (the 22 MHz PASIN digitiser); other SEG-Y files need
+    --dt-ns. All other trace-header values are copied unchanged, except that
+    empty CDP number and CDP x/y fields are filled from the source fields.
+    """
+    T = segyio.TraceField
+    with segyio.open(src, ignore_geometry=True) as f:
+        n_tr, n = f.tracecount, f.header[0][T.TRACE_SAMPLE_COUNT]
+        trace_dt, bin_dt = f.header[0][T.TRACE_SAMPLE_INTERVAL], f.bin[segyio.BinField.Interval]
+        is_bas = trace_dt == 45 and bin_dt == 1000
+        if args.dt_ns:
+            dt = args.dt_ns * 1e-9
+        elif is_bas:
+            dt = PRESETS["bas"]["dt_s"]
+            print(f"  BAS PASIN SEG-Y recognised (trace interval 45, binary 1000); "
+                  f"using {dt * 1e9:.4f} ns (22 MHz)")
+        else:
+            raise SystemExit(f"{src}: true sample interval unknown; give --dt-ns.")
+        t0 = f.header[0][T.DelayRecordingTime] * 0.0   # delays not used by BAS
+        plan = plan_time_axis(t0, dt, n, args)
+
+        lines = [
+            f"RADAR SEG-Y REWRITTEN FROM {Path(src).name}",
+            f"TRUE SAMPLE INTERVAL {dt * 1e9:.4f} NS; ORIGINAL HEADERS: TRACE "
+            f"{trace_dt}, BINARY {bin_dt}",
+            *axis_text_lines(args, plan),
+            "DATA " + ("10*LOG10 OF ORIGINAL VALUES" if args.to_db else "ORIGINAL VALUES"),
+            "OTHER TRACE HEADERS COPIED FROM ORIGINAL; CDP FILLED FROM SOURCE",
+        ]
+        if is_bas:
+            lines += ["BAS VALUES ARE LINEAR POWER DESPITE DBM LABEL IN NETCDF",
+                      "ORIGINAL YEAR/DAY/TIME WERE FILE-CREATION VALUES; SET TO ZERO",
+                      "COORDS EPSG:3031 METRES; BYTE 9 = PRI NUMBER"]
+        lines.append("SEG-Y REV 1, IEEE FLOAT32, BIG-ENDIAN")
+
+        spec = segyio.spec()
+        spec.format, spec.sorting, spec.tracecount = 5, 0, n_tr
+        spec.samples = np.arange(plan["n"]) * plan["stored"]
+        with segyio.create(out_path, spec) as g:
+            g.text[0] = text_header(lines)
+            g.bin.update({
+                segyio.BinField.Interval: plan["stored"], segyio.BinField.Samples: plan["n"],
+                segyio.BinField.Format: 5, segyio.BinField.MeasurementSystem: 1,
+                segyio.BinField.SEGYRevision: 1, segyio.BinField.SEGYRevisionMinor: 0,
+                segyio.BinField.TraceFlag: 1,
+            })
+            for start in range(0, n_tr, args.block):
+                stop = min(start + args.block, n_tr)
+                block = np.asarray(f.trace.raw[start:stop], dtype=np.float64)
+                if args.to_db:
+                    block = 10 * np.log10(np.maximum(block, np.finfo(np.float32).tiny))
+                if plan["idx"] is not None:
+                    i0, w = plan["idx"], plan["wgt"]
+                    block = block[:, i0] * (1 - w) + block[:, i0 + 1] * w
+                block = block.astype(np.float32)
+                for j, i in enumerate(range(start, stop)):
+                    h = dict(f.header[i])
+                    h[T.TRACE_SAMPLE_COUNT] = plan["n"]
+                    h[T.TRACE_SAMPLE_INTERVAL] = plan["stored"]
+                    if not h[T.CDP]:
+                        h[T.CDP] = h[T.EnergySourcePoint] or i + 1
+                    if not h[T.CDP_X] and not h[T.CDP_Y]:
+                        h[T.CDP_X], h[T.CDP_Y] = h[T.SourceX], h[T.SourceY]
+                    if is_bas:
+                        for fld in (T.YearDataRecorded, T.DayOfYear, T.HourOfDay,
+                                    T.MinuteOfHour, T.SecondOfMinute):
+                            h[fld] = 0
+                    g.header[i] = h
+                    g.trace[i] = np.ascontiguousarray(block[j])
+    print(f"  {n_tr} traces x {plan['n']} samples, interval {plan['stored']} "
+          f"{plan['uname']} -> {out_path}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("inputs", nargs="+", help="NetCDF file(s)")
+    p.add_argument("inputs", nargs="+", help="NetCDF or SEG-Y file(s)")
     p.add_argument("--outdir", default=".", help="output folder (default: current)")
     p.add_argument("--preset", choices=list(PRESETS), help="file layout (default: detect)")
     p.add_argument("--data", action="append", help="radar variable(s); default: all in preset")
@@ -368,8 +505,9 @@ def main():
     p.add_argument("--time", help="per-trace timestamp variable")
     p.add_argument("--date", help="flight date YYYY-MM-DD when the file gives only time of day")
     p.add_argument("--dt-ns", type=float, help="override the sample interval (ns)")
-    p.add_argument("--time-units", choices=list(HEADER_UNIT_S), default="ns",
-                   help="meaning of one header time unit (default ns, as BAS)")
+    p.add_argument("--axis", choices=list(AXIS_UNIT_S), default="us",
+                   help="what a time axis labelled ms shows: us (default, as BAS), "
+                        "ns, or true ms (radar intervals are too short for ms)")
     p.add_argument("--inexact", choices=["resample", "round", "fail"], default="resample",
                    help="what to do if the interval is not a whole header unit")
     p.add_argument("--to-db", action="store_true", help="write 10*log10 of linear power")
@@ -381,6 +519,13 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     for src in args.inputs:
+        if Path(src).suffix.lower() in (".sgy", ".segy"):
+            print(f"{src} (SEG-Y input)")
+            out = outdir / f"{Path(src).stem}_{args.axis}axis.sgy"
+            if out.resolve() == Path(src).resolve():
+                raise SystemExit("Output would overwrite the input; choose another --outdir.")
+            convert_segy(src, str(out), args)
+            continue
         ds = xr.open_dataset(src)
         name = args.preset or detect_preset(ds)
         cfg = dict(PRESETS[name]) if name else {"crs": "EPSG:3031"}

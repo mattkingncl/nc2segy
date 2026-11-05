@@ -27,7 +27,7 @@ Examples
 --------
     python nc2segy.py WISE_ISODYN_W15.nc --outdir segy/
     python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --outdir segy/
-    python nc2segy.py W15.nc --data chirp_data --date 2005-12-01   # BAS has no flight date
+    python nc2segy.py W15.nc --data chirp_data --date YYYY-MM-DD   # BAS files give no flight date
 
 Requires: numpy, pandas, xarray, netCDF4, segyio; pyproj when projecting lat/lon.
 """

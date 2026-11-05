@@ -35,6 +35,7 @@ Examples
     python nc2segy.py WISE_ISODYN_W15.nc --outdir segy/
     python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --axis ns --outdir segy/
     python nc2segy.py W15_chirp.segy --outdir segy/          # repair BAS SEG-Y
+    python nc2segy.py WISE_ISODYN_W15.nc W15_chirp.segy --kingdom --outdir kingdom/
     python nc2segy.py W15.nc --data chirp_data --date YYYY-MM-DD   # BAS files give no flight date
 
 Requires: numpy, pandas, xarray, netCDF4, segyio; pyproj when projecting lat/lon.
@@ -49,6 +50,9 @@ import numpy as np
 import pandas as pd
 import segyio
 import xarray as xr
+
+# Show warnings as one plain line instead of Python's file-and-line format.
+warnings.formatwarning = lambda message, *args, **kwargs: f"  WARNING: {message}\n"
 
 # ---------------------------------------------------------------- constants --
 
@@ -78,6 +82,7 @@ PRESETS = {
         x="x_coordinates", y="y_coordinates", crs="EPSG:3031",
         elev="aircraft_altitude_layerData", surface="surface_altitude_layerData",
         time_of_day="UTC_time_layerData", record="PriNumber_layerData",
+        linear_power=True,           # values are linear power despite "dBm" label
         trace_no="traces",
         # The fast_time axis in these files spans 0 to N*dt over N samples, so its
         # spacing is slightly too large. Use the 22 MHz digitiser interval
@@ -306,6 +311,8 @@ def convert(ds, src, data_name, out_path, cfg, args):
                           "are left at zero. Use --date YYYY-MM-DD to fill them.")
 
     cs, es = args.coord_scalar, -100            # elevations always to 1 cm
+    # --kingdom converts known linear-power data (BAS) to dB for display.
+    to_db = args.to_db or (args.kingdom and cfg.get("linear_power", False))
     def scaled(v, s):
         # SEG-Y scalar convention: negative s divides, positive s multiplies.
         return int(round(v * (-s if s < 0 else 1 / s)))
@@ -315,6 +322,7 @@ def convert(ds, src, data_name, out_path, cfg, args):
     lines = [
         f"RADAR PROFILE CONVERTED FROM NETCDF: {Path(src).name}",
         f"VARIABLE {data_name} UNITS {units}",
+        "DATA WRITTEN AS 10*LOG10 OF ORIGINAL VALUES (DB)" if to_db else "DATA WRITTEN AS ORIGINAL VALUES",
         f"INSTITUTION {str(ds.attrs.get('institution', '')).splitlines()[0] if ds.attrs.get('institution') else 'UNKNOWN'}",
         f"FLIGHT {ds.attrs.get('flight', '')} CAMPAIGN {ds.attrs.get('campaign', '')}",
         *axis_text_lines(args, plan),
@@ -345,13 +353,13 @@ def convert(ds, src, data_name, out_path, cfg, args):
         for start in range(0, n_tr, args.block):
             stop = min(start + args.block, n_tr)
             block = da.isel({tdim: slice(start, stop)}).values.astype(np.float64)
-            if start == 0 and "db" in units.lower() and not args.to_db:
+            if start == 0 and "db" in units.lower() and not to_db:
                 lo, hi = np.nanmin(block), np.nanmax(block)
                 if lo >= 0 and hi > 1e4 * max(lo, 1e-30):
                     warnings.warn(f"Units say '{units}', but values span {lo:.3g} to "
                                   f"{hi:.3g}, which looks like linear power, not dB. "
                                   "Use --to-db to write 10*log10 values.")
-            if args.to_db:
+            if to_db:
                 block = 10 * np.log10(np.maximum(block, np.finfo(np.float32).tiny))
             if plan["idx"] is not None:
                 i0, w = plan["idx"], plan["wgt"]
@@ -432,8 +440,9 @@ def convert_segy(src, out_path, args):
             print(f"  BAS PASIN SEG-Y recognised (trace interval 45, binary 1000); "
                   f"using {dt * 1e9:.4f} ns (22 MHz)")
         else:
-            raise SystemExit(f"{src}: true sample interval unknown; give --dt-ns.")
-        t0 = f.header[0][T.DelayRecordingTime] * 0.0   # delays not used by BAS
+            raise ValueError("true sample interval unknown; give --dt-ns.")
+        t0 = 0.0                                       # delays not used by BAS
+        to_db = args.to_db or (args.kingdom and is_bas)
         plan = plan_time_axis(t0, dt, n, args)
 
         lines = [
@@ -441,7 +450,7 @@ def convert_segy(src, out_path, args):
             f"TRUE SAMPLE INTERVAL {dt * 1e9:.4f} NS; ORIGINAL HEADERS: TRACE "
             f"{trace_dt}, BINARY {bin_dt}",
             *axis_text_lines(args, plan),
-            "DATA " + ("10*LOG10 OF ORIGINAL VALUES" if args.to_db else "ORIGINAL VALUES"),
+            "DATA " + ("10*LOG10 OF ORIGINAL VALUES (DB)" if to_db else "ORIGINAL VALUES"),
             "OTHER TRACE HEADERS COPIED FROM ORIGINAL; CDP FILLED FROM SOURCE",
         ]
         if is_bas:
@@ -464,7 +473,7 @@ def convert_segy(src, out_path, args):
             for start in range(0, n_tr, args.block):
                 stop = min(start + args.block, n_tr)
                 block = np.asarray(f.trace.raw[start:stop], dtype=np.float64)
-                if args.to_db:
+                if to_db:
                     block = 10 * np.log10(np.maximum(block, np.finfo(np.float32).tiny))
                 if plan["idx"] is not None:
                     i0, w = plan["idx"], plan["wgt"]
@@ -505,28 +514,55 @@ def main():
     p.add_argument("--time", help="per-trace timestamp variable")
     p.add_argument("--date", help="flight date YYYY-MM-DD when the file gives only time of day")
     p.add_argument("--dt-ns", type=float, help="override the sample interval (ns)")
-    p.add_argument("--axis", choices=list(AXIS_UNIT_S), default="us",
+    p.add_argument("--axis", choices=list(AXIS_UNIT_S), default=None,
                    help="what a time axis labelled ms shows: us (default, as BAS), "
                         "ns, or true ms (radar intervals are too short for ms)")
     p.add_argument("--inexact", choices=["resample", "round", "fail"], default="resample",
                    help="what to do if the interval is not a whole header unit")
     p.add_argument("--to-db", action="store_true", help="write 10*log10 of linear power")
-    p.add_argument("--coord-scalar", type=int, default=-100,
+    p.add_argument("--coord-scalar", type=int, default=None,
                    help="SEG-Y coordinate scalar (default -100 = cm; 1 = whole metres)")
+    p.add_argument("--kingdom", action="store_true",
+                   help="settings for Kingdom: --axis us, --coord-scalar 1, and dB for "
+                        "BAS linear power (explicit options still win)")
     p.add_argument("--block", type=int, default=2000, help="traces read at a time")
     args = p.parse_args()
 
+    # Fill options the user did not set, from --kingdom or the general defaults.
+    if args.axis is None:
+        args.axis = "us"
+    if args.coord_scalar is None:
+        args.coord_scalar = 1 if args.kingdom else -100
+    if args.kingdom:
+        print(f"Kingdom settings: axis {args.axis}, coordinate scalar {args.coord_scalar}, "
+              f"BAS linear power written in dB" + ("" if not args.to_db else "; --to-db for all"))
+
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    failed = []
     for src in args.inputs:
-        if Path(src).suffix.lower() in (".sgy", ".segy"):
-            print(f"{src} (SEG-Y input)")
-            out = outdir / f"{Path(src).stem}_{args.axis}axis.sgy"
-            if out.resolve() == Path(src).resolve():
-                raise SystemExit("Output would overwrite the input; choose another --outdir.")
-            convert_segy(src, str(out), args)
-            continue
-        ds = xr.open_dataset(src)
+        # A problem with one file is reported and the rest are still converted.
+        try:
+            convert_file(src, outdir, args)
+        except (ValueError, KeyError, OSError) as err:
+            msg = err.args[0] if err.args else repr(err)
+            print(f"  ERROR: {msg}")
+            failed.append(src)
+    if failed:
+        raise SystemExit(f"{len(failed)} of {len(args.inputs)} file(s) not converted: "
+                         + ", ".join(failed))
+
+
+def convert_file(src, outdir, args):
+    """Convert one input file (NetCDF or SEG-Y) into one or more SEG-Y files."""
+    if Path(src).suffix.lower() in (".sgy", ".segy"):
+        print(f"{src} (SEG-Y input)")
+        out = outdir / f"{Path(src).stem}_{args.axis}axis.sgy"
+        if out.resolve() == Path(src).resolve():
+            raise ValueError("Output would overwrite the input; choose another --outdir.")
+        convert_segy(src, str(out), args)
+        return
+    with xr.open_dataset(src) as ds:
         name = args.preset or detect_preset(ds)
         cfg = dict(PRESETS[name]) if name else {"crs": "EPSG:3031"}
         for key in ("trace_dim", "sample_dim", "sample_var", "x", "y", "lat", "lon",
@@ -535,13 +571,12 @@ def main():
                 cfg[key] = getattr(args, key)
         data = args.data or cfg.get("data")
         if not data or not cfg.get("trace_dim") or not cfg.get("sample_dim"):
-            raise SystemExit(f"{src}: layout not recognised; give --data, --trace-dim, "
+            raise ValueError("layout not recognised; give --data, --trace-dim, "
                              "--sample-dim and --sample-var.")
         cfg.setdefault("sample_var", cfg["sample_dim"])
         print(f"{src} (layout: {name or 'custom'})")
         for d in data:
             convert(ds, src, d, str(outdir / f"{Path(src).stem}_{d}.sgy"), cfg, args)
-        ds.close()
 
 
 if __name__ == "__main__":

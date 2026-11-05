@@ -22,12 +22,53 @@ pip install -r requirements.txt
 
 ## Quick start
 
+For Kingdom, convert everything in one go:
+
 ```
-python nc2segy.py WISE_ISODYN_W15.nc ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --outdir segy/
-python nc2segy.py W15_chirp.segy --outdir segy/
+python nc2segy.py WISE_ISODYN_W15.nc ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc W15_chirp.segy --kingdom --outdir kingdom
 ```
 
+Without `--kingdom`, the same command keeps BAS values as linear power and stores coordinates to the centimetre.
+
 Each NetCDF radar variable goes to its own file, named `<input stem>_<variable>.sgy`. A SEG-Y input is written as `<input stem>_<axis>axis.sgy`, for example `W15_chirp_usaxis.sgy`. Input files are never overwritten.
+
+## Loading into Kingdom
+
+Kingdom is seismic software, so it expects time in milliseconds and velocities in metres per second. Radar travel times are a thousand times shorter, so the converter rescales time to fit, and velocities must be rescaled to match. The rescaling is a deliberate fudge: it is harmless as long as the same factor is used throughout. The `--kingdom` option applies suitable settings:
+
+```
+python nc2segy.py WISE_ISODYN_W15.nc ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc W15_chirp.segy --kingdom --outdir kingdom
+```
+
+Example 1 under [Example runs](#example-runs) shows what this prints.
+
+| Setting | Value | Why |
+|---|---|---|
+| `--axis us` | Header unit 1 ns | Kingdom's "ms" reads as µs, so a 64 µs record looks like a normal 64 ms seismic record |
+| `--coord-scalar 1` | Whole metres | Avoids lines landing 100 times too far out if the importer ignores the scalar in byte 71; ±0.5 m is far below the radar footprint |
+| dB for BAS | 10·log10 of linear power | BAS values span about 7 orders of magnitude, which colour scales cannot show; dB gives roughly −3 to 67 dB for W15 |
+
+Options you give explicitly still win; for example, `--kingdom --axis ns` gives a nanosecond axis. UTIG data are already in dB and are not converted again. A repaired BAS SEG-Y keeps its original whole-metre coordinates.
+
+**Velocities for depth conversion.** Kingdom computes depth as v·t/2 with t in its "ms", so enter velocities scaled by the same factor:
+
+| Medium | True velocity | Enter in Kingdom (`--axis us`) | Enter in Kingdom (`--axis ns`) |
+|---|---|---|---|
+| Air (aircraft to ice surface) | 299.8 m/µs | 299 800 m/s | 299.8 m/s |
+| Ice (the value BAS used) | 168 m/µs | 168 000 m/s | 168 m/s |
+
+As a check, a bed echo 36 µs below the surface echo gives 168 000 m/s × 0.036 s ÷ 2 = 3024 m of ice. The first 2–5 µs of each trace are the air gap below the aircraft, so a depth model needs an air layer above the ice-surface horizon.
+
+**Byte locations for Kingdom's 2-D SEG-Y import.**
+
+| Item | Bytes |
+|---|---|
+| CDP number | 21 |
+| Shot point | 17 |
+| x, y | 73, 77 (source) or 181, 185 (CDP) |
+| Coordinate system | EPSG:3031, WGS 84 Antarctic Polar Stereographic |
+
+These settings follow from how the files are built; they have not been tested in Kingdom. Load one line and check its position, its time of the bed echo and one depth conversion before converting a whole survey.
 
 ## Time axis
 
@@ -57,28 +98,49 @@ With `round`, the −1.00 % error is about 0.40 µs at a 40 µs bed. At 168 m/µ
 
 ## Example runs
 
-These are real runs on the example files; long warning lines are shortened to the message. The outputs were checked as described under [Verification](#verification).
+Every command below was run on the example files, and the output shown is exactly what it printed. Each run reports the true interval it used, any warnings, and one line per file written. If a file can't be converted, the script prints one `ERROR` line for it, carries on with the remaining files, and exits with status 1.
 
-### 1. Default conversion of the NetCDF files
+### 1. Everything for Kingdom
+
+```
+$ python nc2segy.py WISE_ISODYN_W15.nc ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc W15_chirp.segy --kingdom --outdir kingdom
+Kingdom settings: axis us, coordinate scalar 1, BAS linear power written in dB
+WISE_ISODYN_W15.nc (layout: bas)
+    using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
+  WARNING: File gives time of day but no date; year and day-of-year are left at zero. Use --date YYYY-MM-DD to fill them.
+  chirp_data: 12278 traces x 1414 samples, interval 45 ns -> kingdom/WISE_ISODYN_W15_chirp_data.sgy
+    using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
+  pulse_data: 12278 traces x 1414 samples, interval 45 ns -> kingdom/WISE_ISODYN_W15_pulse_data.sgy
+ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc (layout: utig)
+  amplitude_high_gain: 4000 traces x 3200 samples, interval 20 ns -> kingdom/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_high_gain.sgy
+  amplitude_low_gain: 4000 traces x 3200 samples, interval 20 ns -> kingdom/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_low_gain.sgy
+W15_chirp.segy (SEG-Y input)
+  BAS PASIN SEG-Y recognised (trace interval 45, binary 1000); using 45.4545 ns (22 MHz)
+  12278 traces x 1414 samples, interval 45 ns -> kingdom/W15_chirp_usaxis.sgy
+```
+
+This writes five files. `kingdom/WISE_ISODYN_W15_chirp_data.sgy` and `kingdom/W15_chirp_usaxis.sgy` hold the same W15 chirp traces, bit for bit, made from the NetCDF and the BAS SEG-Y respectively. The BAS traces grow from 1400 to 1414 samples because they are resampled from 45.45 ns to 45 ns over the same 63.6 µs record. The UTIG interval of 20 ns is stored exactly, so its samples are unchanged.
+
+### 2. Default conversion of the NetCDF files
 
 ```
 $ python nc2segy.py WISE_ISODYN_W15.nc ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --outdir segy
 WISE_ISODYN_W15.nc (layout: bas)
     using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
-UserWarning: File gives time of day but no date; year and day-of-year are left at zero. Use --date YYYY-MM-DD to fill them.
-UserWarning: Units say 'Power in decibel-milliwatts (dBm)', but values span 0.413 to 4.61e+06, which looks like linear power, not dB. Use --to-db to write 10*log10 values.
+  WARNING: File gives time of day but no date; year and day-of-year are left at zero. Use --date YYYY-MM-DD to fill them.
+  WARNING: Units say 'Power in decibel-milliwatts (dBm)', but values span 0.413 to 4.61e+06, which looks like linear power, not dB. Use --to-db to write 10*log10 values.
   chirp_data: 12278 traces x 1414 samples, interval 45 ns -> segy/WISE_ISODYN_W15_chirp_data.sgy
     using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
-UserWarning: Units say 'Power in decibel-milliwatts (dBm)', but values span 1.11e-05 to 2.21, which looks like linear power, not dB. Use --to-db to write 10*log10 values.
+  WARNING: Units say 'Power in decibel-milliwatts (dBm)', but values span 1.11e-05 to 2.21, which looks like linear power, not dB. Use --to-db to write 10*log10 values.
   pulse_data: 12278 traces x 1414 samples, interval 45 ns -> segy/WISE_ISODYN_W15_pulse_data.sgy
 ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc (layout: utig)
   amplitude_high_gain: 4000 traces x 3200 samples, interval 20 ns -> segy/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_high_gain.sgy
   amplitude_low_gain: 4000 traces x 3200 samples, interval 20 ns -> segy/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_low_gain.sgy
 ```
 
-The BAS traces grow from 1400 to 1414 samples because they are resampled from 45.45 ns to 45 ns over the same 63.6 µs record. The UTIG interval of 20 ns is stored exactly, so its samples are unchanged.
+Without `--kingdom`, BAS values stay as linear power and coordinates are stored to the centimetre. The warnings say how to change either.
 
-### 2. Repairing a BAS-supplied SEG-Y file
+### 3. Repairing a BAS-supplied SEG-Y file
 
 ```
 $ python nc2segy.py W15_chirp.segy --outdir segy
@@ -101,38 +163,73 @@ A BAS PASIN SEG-Y file is recognised by its two conflicting header intervals: 45
 * sets the year, day and time fields to zero, because BAS filled them with the file-creation date;
 * writes a readable textual header describing all of this.
 
-For any other SEG-Y file the true interval can't be inferred, so give it with `--dt-ns`.
+With `--axis ns` the traces are upsampled ×2, so 1400 samples become 2799, and every original sample is kept.
 
-### 3. Reproducing the BAS-supplied SEG-Y from NetCDF
+A SEG-Y file that doesn't match the BAS pattern is refused, because its true interval can't be inferred:
+
+```
+$ python nc2segy.py segy/W15_chirp_usaxis.sgy --outdir x
+segy/W15_chirp_usaxis.sgy (SEG-Y input)
+  ERROR: true sample interval unknown; give --dt-ns.
+1 of 1 file(s) not converted: segy/W15_chirp_usaxis.sgy
+```
+
+### 4. Reproducing the BAS-supplied SEG-Y from NetCDF
 
 ```
 $ python nc2segy.py WISE_ISODYN_W15.nc --data chirp_data --inexact round --coord-scalar 1 --outdir bas_style
 WISE_ISODYN_W15.nc (layout: bas)
     using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
-UserWarning: Header interval rounded from 45.4545 to 45 ns: every travel time read from the SEG-Y is off by -1.00% (-0.636 us at the last sample).
-...
+  WARNING: Header interval rounded from 45.4545 to 45 ns: every travel time read from the SEG-Y is off by -1.00% (-0.636 us at the last sample).
+  WARNING: File gives time of day but no date; year and day-of-year are left at zero. Use --date YYYY-MM-DD to fill them.
+  WARNING: Units say 'Power in decibel-milliwatts (dBm)', but values span 0.413 to 4.61e+06, which looks like linear power, not dB. Use --to-db to write 10*log10 values.
   chirp_data: 12278 traces x 1400 samples, interval 45 ns -> bas_style/WISE_ISODYN_W15_chirp_data.sgy
 ```
 
-This keeps the native samples and whole-metre coordinates, like `W15_chirp.segy`, and the trace data are bit-identical to that file. The warning states the timing error that this choice carries.
+This keeps the native samples and whole-metre coordinates, like `W15_chirp.segy`, and the trace data are bit-identical to that file. The first warning states the timing error that this choice carries; it is there to show what the BAS files do, not as a recommendation.
 
-### 4. Other common variations
+### 5. Nanosecond time axis
 
 ```
-# Time axis in nanoseconds
-python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --axis ns --outdir segy
-
-# Write BAS power in decibels, and fill in the flight date (the file has none)
-python nc2segy.py WISE_ISODYN_W15.nc --to-db --date YYYY-MM-DD --outdir segy
-
-# Repair a whole folder of BAS SEG-Y files
-python nc2segy.py bas_segy/*.segy --outdir segy
-
-# Refuse to write anything if the interval cannot be stored exactly
-python nc2segy.py WISE_ISODYN_W15.nc --inexact fail
+$ python nc2segy.py ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc --axis ns --outdir segy_ns
+ER2HI1B_2016009_ASB1_JKB2n_R44a_000.nc (layout: utig)
+  amplitude_high_gain: 4000 traces x 3200 samples, interval 20000 ps -> segy_ns/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_high_gain.sgy
+  amplitude_low_gain: 4000 traces x 3200 samples, interval 20000 ps -> segy_ns/ER2HI1B_2016009_ASB1_JKB2n_R44a_000_amplitude_low_gain.sgy
 ```
 
-Replace `YYYY-MM-DD` with the real flight date; I have not been able to verify the W15 flight date. In Windows PowerShell, wildcards such as `*.segy` are not expanded for Python. Run `python nc2segy.py (Get-ChildItem bas_segy\*.segy).FullName --outdir segy` instead.
+The 20 ns UTIG interval fits as 20 000 ps, so the samples are unchanged.
+
+### 6. True milliseconds are refused
+
+```
+$ python nc2segy.py WISE_ISODYN_W15.nc --data chirp_data --axis ms --outdir x
+WISE_ISODYN_W15.nc (layout: bas)
+    using digitiser interval 45.4545 ns instead of the axis spacing 45.4870 ns
+  ERROR: A 45.4545 ns interval cannot be written in whole us: it would need resampling to 1 us, discarding about 95% of the samples. Choose a finer --axis.
+1 of 1 file(s) not converted: WISE_ISODYN_W15.nc
+```
+
+### 7. Filling in the flight date
+
+The BAS NetCDF files give time of day only. If you know the flight date, give it:
+
+```
+python nc2segy.py WISE_ISODYN_W15.nc --kingdom --date YYYY-MM-DD --outdir kingdom
+```
+
+Replace `YYYY-MM-DD` with the real date; I have not been able to verify the W15 flight date. As a test, `--date 2000-01-01` wrote year 2000, day 1 and 00:27:44 UTC into the first trace header, which matches `UTC_time_layerData`.
+
+### 8. Converting a whole folder
+
+```
+# Linux or macOS
+python nc2segy.py bas_segy/*.segy --kingdom --outdir kingdom
+
+# Windows PowerShell, which does not expand wildcards for Python
+python nc2segy.py (Get-ChildItem bas_segy\*.segy).FullName --kingdom --outdir kingdom
+```
+
+Output files are named after their inputs, so two inputs with the same name in different folders would overwrite each other's output. Only the Linux form was tested here.
 
 ## Trace header layout (NetCDF input)
 
@@ -164,6 +261,7 @@ All of these checks were run on the example files.
 * **BAS NetCDF, `--inexact round --coord-scalar 1`.** The trace data are bit-identical to `W15_chirp.segy`. PRI numbers and trace numbers match exactly, and x/y agree within 1 m. The 1 m differences come from rounding, because the reference appears to round differently.
 * **BAS NetCDF, default.** Resampled samples match an independent `numpy.interp` to a relative error of 3 × 10⁻⁶ (float32 precision). Coordinates match the NetCDF exactly, elevations within 0.5 cm, and time of day within the 1 s truncation that SEG-Y imposes.
 * **Effect of resampling on bed echoes (`--axis us`).** Across 9394 picked bed echoes, the peak power changes by a median of −0.04 dB. The 5th percentile is −0.52 dB, the 1st percentile is −1.0 dB, and the worst single trace is −3.1 dB. The cause is that linear interpolation lowers sharp peaks sampled barely above the Nyquist rate. Use `--axis ns` or `--inexact round` if amplitudes matter.
+* **`--kingdom`.** BAS dB values match an independent 10·log10-then-interpolate calculation to 1 × 10⁻⁵ dB, and coordinates round to within 0.5 m. Converting `W15_chirp.segy` and `WISE_ISODYN_W15.nc` gives bit-identical traces. UTIG data are written unchanged. Resampling in dB changes bed-echo peaks by a median of −0.04 dB (1st percentile −1.1 dB, worst −3.3 dB), much as in linear power.
 * **`--axis ns`.** For BAS, every second output sample is bit-identical to the original samples. For UTIG, the output is identical to the NetCDF.
 * **BAS SEG-Y repair.** For both `--axis us` and `--axis ns`, the repaired `W15_chirp.segy` traces are bit-identical to those converted from `WISE_ISODYN_W15.nc`. Coordinates, PRI numbers and trace numbers are copied unchanged.
 * **UTIG.** The samples are bit-identical to the NetCDF. x/y agree within 5 mm of an independent pyproj projection, and elevations within 0.5 cm. The UTC date and time are written in full.
@@ -228,6 +326,7 @@ The fast-time variable needs a `units` attribute in s, ms, µs (`microseconds`),
 --inexact {resample,round,fail}
                       what to do if the interval is not a whole header unit
 --to-db               write 10*log10 of linear power
+--kingdom             Kingdom settings: --axis us, --coord-scalar 1, BAS in dB
 --coord-scalar N      SEG-Y coordinate scalar (default -100 = cm; 1 = whole metres)
 --block BLOCK         traces read at a time (memory use)
 ```
@@ -239,4 +338,4 @@ The fast-time variable needs a `units` attribute in s, ms, µs (`microseconds`),
 * **Two dimensions only.** Data with extra dimensions, such as channels, need converting to separate 2-D variables first.
 * **No picks in the output.** Surface and bed picks have no standard SEG-Y field and are not written. Load them into your software as horizons from the NetCDF.
 * **SEG-Y repair assumes BAS conventions.** It is tested only on `W15_chirp.segy`. Delay-recording times in other SEG-Y files are ignored.
-* **Untested in commercial software.** I have not tested the output in Petrel, Kingdom or OpendTect. Check one line in your software before converting a whole survey.
+* **Untested in commercial software.** I have not tested the output in Kingdom, Petrel or OpendTect. Check one line in your software before converting a whole survey.
